@@ -49,9 +49,9 @@ We focus particularly on accurately estimating demand during **extreme weather d
 
 | Model | Adjusted R² | RMSE | MAE | Extreme MAE |
 |-------|-------------|------|-----|--------------|
-| M0 (Baseline) | Basic features only | – | – | – |
-| M1 | Adds temperature & trends | – | – | – |
-| M2 (Final) | Adds non-linearities & interactions | Best overall fit |
+| M0 (Baseline) | Basic features only | 0.464 | 3739.9 | 2960.7 | 5023.7 |
+| M1 | Adds temperature & trends | 0.780 | 2394.9 | 1512.7 | 1916.8 |
+| M2 (Final) | Adds non-linearities & interactions | Best overall fit | 0.795 | 2307.3 | 1420.2 | 1917.7 |
 
 Results are also evaluated using:
 - **Mean Squared Error (MSE)**

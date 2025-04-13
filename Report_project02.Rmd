@@ -1,0 +1,1476 @@
+---
+title: "Modelling Peak Electricity Demand in Great Britain [2842 words]"
+author: "Group-26: Sulixiang Lu, Shiyuan Feng, Yichong Gao"
+output:
+  html_document:
+    number_sections: no
+  pdf_document:
+    number_sections: no
+header-includes:
+  - \newcommand{\bm}[1]{\boldsymbol{#1}}
+  - \newcommand{\mat}[1]{\begin{bmatrix}#1\end{bmatrix}}
+---
+
+```{r setup, include = FALSE}
+# Load required packages
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(knitr)
+library(dplyr)
+library(kableExtra)
+library(broom)
+library(lubridate)
+library(car)         # For calculating Variance Inflation Factor (VIF)
+library(quantreg)    # Quantile regression
+library(caret)       # Cross-validation
+library(glmnet)      # Regularized regression
+library(broom)       # Tidy up model outputs
+library(quantreg)    # Quantile Regression Analysis of Renewable Energy
+# Set default code chunk options
+knitr::opts_chunk$set(
+  echo = FALSE,
+  eval = TRUE,
+  results = 'hide'  # 不显示输出
+)
+
+suppressPackageStartupMessages(library(tidyverse))
+theme_set(theme_bw())
+
+# To give the same random number sequence every time the document is knited,
+# making it easier to discuss the specific numbers in the text:
+set.seed(12345L)
+```
+
+```{r code=readLines("code.R"), eval=TRUE, echo=FALSE, results = 'hide'}
+# Do not change this code chunk
+# Load function definitions
+source("code.R")
+```
+
+```{r, eval=TRUE, echo=FALSE, results = 'hide'}
+# Load data sets
+demand_modelling <- read.csv("SCS_demand_modelling.csv", stringsAsFactors = FALSE) %>%
+  mutate(Date = as.Date(Date))   # Ensure the date format is correct
+hourly_temp <- read.csv("SCS_hourly_temp.csv", stringsAsFactors = FALSE) 
+```
+
+# Introduction
+
+### Task Overview
+
+This report addresses the critical task of modeling future daily peak electricity demand in Great Britain for the National Electricity System Operator (NESO). The primary objective is to develop a reliable linear regression model that can generate realistic simulations of daily peak demand, particularly focusing on high-risk periods of electricity shortfalls. These periods typically occur during winter months due to increased heating and lighting needs, making accurate demand forecasting essential for long-term system planning and security of supply analysis.
+
+### Data Description
+
+Two datasets are provided for analysis:
+
+1. **SCS_demand_modelling.csv**: Contains historical demand data and various explanatory variables such as wind and solar generation capacity factors, temperature, day of the week, month, and year. This dataset focuses on winter periods when demand is highest. 
+
+2. **SCS_hourly_temp.csv**: Provides hourly temperature data. 
+The daily peak demand is assumed to occur at 6 p.m.
+
+```{r, results = 'asis', fig.cap="Data Description"}
+# Display head of demand_modelling dataset
+demand_head <- head(demand_modelling)
+kable(demand_head, caption = "Head of Demand Modelling Dataset") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+# Display head of hourly_temp dataset
+hourly_temp_head <- head(hourly_temp)
+kable(hourly_temp_head, caption = "Head of Hourly Temperature Dataset") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### Methodology
+
+- **Data Import and Cleaning**: Ensure correct date formats, remove duplicates, and align hourly temperature data with daily peak demand at 6 p.m.  
+
+- **Exploratory Visualizations**: Reveal key patterns in temperature, seasonality, and demand extremes.  
+
+- **Feature Engineering**: Create polynomial temperature terms, weekend indicators, and segmented time trends.  
+
+- **Model Building**: Construct and iteratively refine several linear regression models.  
+
+- **Model Evaluation**: Assess performance using cross-validation, RMSE, MAE, and residual diagnostics.  
+
+- **Scenario Analysis**: Explore how peak demand varies under historical weather patterns, providing insights into system sensitivity and planning needs.  
+
+### Key Conclusions
+
+The analysis shows that including non-linear temperature effects, time trends, and interaction terms greatly improves the model’s accuracy. The final model (M2) performs better than the basic model (M0) and the improved model (M1) in fitting the data and predicting peak demand, especially on days with extreme demand. Cross-validation results also confirm that the final model is reliable across different months and weather conditions. Scenario analysis clearly shows that peak demand is sensitive to temperature changes and provides valuable information about potential demand patterns under various climate conditions.
+
+The report concludes with recommendations for NESO to utilize the final model for long-term planning and security of supply analysis, while acknowledging the model's limitations and suggesting areas for future improvement.
+
+
+# Data description and exploratory analysis
+
+```{r}
+# Check for missing values
+colSums(is.na(demand_modelling)) 
+colSums(is.na(hourly_temp))   # All 0s indicate no missing values
+
+demand_clean <- demand_modelling %>%
+  # Remove rows with completely missing values
+  filter(!is.na(demand_gross))
+
+# Check for duplicate records
+duplicates <- duplicated(demand_clean)
+if(sum(duplicates) > 0) {
+  print(paste("Duplicates found, removing them. Number of duplicates:", sum(duplicates)))
+  demand_clean <- demand_clean[!duplicates, ]
+} else {
+  print("No duplicate records found")
+}
+```
+
+### Data Cleaning
+
+After an initial inspection of data structure and missing values, we confirmed that both datasets were well-aligned and largely complete. There were no missing values in the temperature dataset, and only a few observations in the demand data lacked values for `demand_gross`. These incomplete rows were removed to ensure data quality and integrity for subsequent modelling.
+
+```{r}
+# Convert hourly_temp$Date from "DD/MM/YYYY HH:MM" character to Date class
+hourly_temp <- hourly_temp %>%
+  mutate(
+    DateTime = dmy_hm(Date),        # First parse as datetime with day-month-year-hour-minute
+    Date = as.Date(DateTime),       # Then extract just the date portion
+    Hour = hour(DateTime)
+  ) %>%
+  select(Date, Hour, temp_hour = temp)
+```
+
+To ensure precise temporal alignment, the `Date` variables in both datasets were converted to R's `Date class`. The hourly temperature dataset, originally in “DD/MM/YYYY HH:MM” format, was parsed using the `dmy_hm()` function to extract date and hour components. Daily peak demand, defined at 6 p.m., was aligned by filtering the dataset to retain only the 6 p.m. temperature readings, which were then merged with the primary demand dataset.
+
+```{r}
+# ---------------------------
+# Feature Engineering
+# ---------------------------
+# Convert categorical variables into factors (dummy variables),
+# fix factor order and labels, and add new response variables.
+demand_features <- demand_clean %>%
+  mutate(
+    # Month (only winter months)
+    monthindex = factor(monthindex, 
+                        levels = c(0, 1, 2, 10, 11),
+                        labels = c("Jan", "Feb", "Mar", "Nov", "Dec")),
+    # Day of the week
+    wdayindex = factor(wdayindex, 
+                       levels = c(0, 1, 2, 3, 4, 5, 6),
+                       labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")),
+    
+    # Weekend indicator (based on corrected wdayindex)
+    is_weekend = ifelse(wdayindex %in% c("Mon", "Tue", "Wed", "Thu", "Fri"), 0, 1),
+    is_weekend = as.factor(is_weekend),
+    
+    # Year effects
+    trend_pre = ifelse(year <= 2006, year - 2006, 0),
+    trend_post = ifelse(year > 2006, year - 2006, 0)
+  )
+
+# Daily min/max temperature (using hourly_temp.csv)
+temp_daily <- hourly_temp %>%
+  group_by(Date) %>%
+  summarise(
+    temp_avg = mean(temp_hour),     # Daily average temperature
+    temp_min = min(temp_hour),      # Daily minimum temperature
+    temp_max = max(temp_hour),      # Daily maximum temperature
+  )
+
+# Merge with main dataset
+demand_features <- demand_features %>%
+  left_join(temp_daily, by = "Date")
+```
+
+### Feature Engineering
+
+- A set of new variables was engineered to capture key structural and temporal patterns in the data. 
+
+- To account for the nonlinear relationship between temperature and demand, a squared temperature term (`temp_sq`) was introduced. 
+
+- The `is_weekend` variable was constructed as a binary factor based on `wdayindex`, allowing for the distinction between weekday and weekend behavior in electricity usage. 
+
+- To address structural shifts over time, particularly around 2006—a identified inflection point in demand behavior—segmented linear trend terms (`trend_pre` for years through 2006 and trend_post for subsequent years) were created. 
+
+- Additionally, daily average (`temp_avg`), minimum (`temp_min`), and maximum (`temp_max`) temperatures were computed from hourly temperature data.
+
+**To explore key demand drivers and seasonality, several visualisations were constructed.**
+
+Distribution of Peak Demand: A histogram of `demand_gross` revealed a right-skewed distribution, highlighting the long upper tail that corresponds to extreme demand days. This distribution supports NESO’s emphasis on capturing upper quantiles, such as the 95th percentile, in its planning framework.
+```{r}
+demand_modelling %>% 
+  ggplot(aes(x = demand_gross)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Distribution of Peak Demand")
+```
+
+A scatterplot of temperature versus demand, colored by day type, showed that demand increases as temperatures decrease, particularly on weekdays, with a more pronounced increase compared to weekends. This indicates that temperature has a stronger influence on electricity usage during the workweek.
+```{r, results = 'asis'}
+# Temperature-demand scatter plot (merging hourly temperature with daily demand)
+# Shows temperature impact on demand and weekend effect
+merged_temp <- hourly_temp %>%
+  filter(Hour == 18) %>%  # Align with daily peak hour
+  inner_join(demand_modelling, by = "Date")
+
+# 调用函数生成图表
+plot_temperature_demand(
+  data = merged_temp,
+  x_var = temp,
+  y_var = demand_gross,
+  day_type_var = wdayindex,
+  title = "Temperature vs Peak Demand: Weekday, Weekend & Global Fit",
+  x_label = "Temperature (°C)",
+  y_label = "Demand (MW)"
+)
+
+```
+
+Calendar-style bar charts for extreme demand days (defined as values above the 95th percentile) showed a strong seasonal concentration in January and February, although the frequency of such days varied considerably across years.
+```{r, results = 'asis'}
+extreme_days <- demand_modelling %>% 
+  mutate(
+    date = as.Date(Date),
+    is_extreme = as.integer(demand_gross > quantile(demand_gross, 0.95, na.rm = TRUE)),
+    month = month(date)
+  )
+extreme_days$is_extreme <- as.factor(extreme_days$is_extreme)
+
+ggplot(extreme_days, aes(x = as.factor(month), fill = factor(is_extreme))) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("0" = "grey80", "1" = "#E45756"), name = "Extreme Demand Days") +
+  facet_wrap(~year, ncol = 3) +
+  labs(title = "The Distribution of Extreme Demand Days", x = "Month", y = "Number of Extreme Demand Days") +
+  theme_minimal()
+```
+
+A composite plot overlaying the number of extreme demand days with monthly average temperatures from 2001 to 2010 highlighted the negative correlation between temperature and peak demand likelihood.
+```{r, results = 'asis'}
+# Filter for years 2001–2010
+extreme_days <- demand_modelling %>% 
+  mutate(
+    date = as.Date(Date),
+    year = year(date),
+    month = month(date),
+    is_extreme = as.integer(demand_gross > quantile(demand_gross, 0.95, na.rm = TRUE))
+  ) %>%
+  filter(year >= 2001 & year <= 2010) %>% 
+  group_by(year, month) %>%
+  summarise(
+    extreme_count = sum(is_extreme),     # Number of extreme demand days per month
+    avg_temp = mean(TE, na.rm = TRUE),    # Average monthly temperature(TE)
+    .groups = "drop"
+  ) %>%
+  ungroup()
+
+# Overlay temperature data to indicate extreme weather events
+# Bars = number of extreme demand days, line = temperature trend
+ggplot(extreme_days, aes(x = factor(month))) +
+  geom_bar(aes(y = extreme_count, fill = "Extreme Demand Days"), 
+           stat = "identity", position = "dodge") +
+  geom_line(aes(y = avg_temp * max(extreme_days$extreme_count) / max(extreme_days$avg_temp), 
+                group = year, color = "Temperature"), linewidth = 1) +
+  scale_fill_manual(values = c("Extreme Demand Days" = "#E45756")) +
+  scale_color_manual(values = c("Temperature" = "blue")) +
+  scale_y_continuous(
+    name = "Extreme Demand Days",
+    sec.axis = sec_axis(~ . * max(extreme_days$avg_temp) / max(extreme_days$extreme_count), 
+                        name = "Average Temperature (°C)")
+  ) +
+  facet_wrap(~year, ncol = 2) +
+  labs(title = "Extreme Demand Days & Temperature Trends (2001–2010)", x = "Month") +
+  theme_minimal()
+```
+
+A line plot of average monthly demand, disaggregated by day type, indicated consistently higher demand on weekdays and a prominent winter peak at March. 
+```{r, results = 'asis'}
+monthly_demand <- demand_modelling %>%
+  mutate(
+    # Ensure monthindex is in the range 0–11
+    monthindex = pmax(0, pmin(11, monthindex)),
+    
+    # Create month factor (1–12 mapped to Jan–Dec)
+    month = factor(
+      monthindex + 1,
+      levels = 1:12,
+      labels = month.abb
+    ),
+    month = factor(month,
+                   levels = c("Nov", "Dec", "Jan", "Feb", "Mar"),
+                   ordered = TRUE),
+    
+    # Weekday/Weekend classification
+    day_type = ifelse(wdayindex %in% c(0, 6), "Weekend", "Weekday")
+  ) %>%
+  group_by(month, day_type) %>%
+  summarise(
+    avg_demand = mean(demand_gross, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(monthly_demand, aes(x = month, y = avg_demand, group = day_type, color = day_type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Weekday" = "#2CA02C", "Weekend" = "#D62728")) +
+  labs(title = "Monthly Demand Trend", 
+       x = "Month", y = "Average Demand (MWh)")
+```
+
+A time-series plot of demand revealed a gradual evolution in peak demand levels, with a discernible structural break around 2006. This inflection likely reflects macro-level shifts such as population dynamics, economic trends, or improved energy efficiency. To account for this temporal non-stationarity, the model incorporated segmented year trend variables (trend_pre and trend_post), enabling the adjustment for historical year effects and enhancing predictive accuracy.
+```{r, results = 'asis'}
+# Plot demand over time to detect trends and anomalies
+ggplot(demand_modelling, aes(x = Date, y = demand_gross)) +
+  geom_smooth(method = "loess", color = "blue", linewidth = 1) +
+  geom_vline(xintercept = as.Date("2006-01-01"), linetype = "dashed", color = "red") +
+  labs(title = "Peak Demand Over Time", x = "Year", y = "Demand (MW)") +
+  scale_x_date(
+    labels = scales::date_format("%Y"), 
+    breaks = "1 year"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+Finally, quantile regression reveals that wind generation has a negative but statistically uncertain impact on peak demand, indicating inconsistent effects across quantiles. In contrast, solar generation demonstrates a weaker but more stable influence.
+```{r, results = 'asis'}
+# Build quantile regression model
+rq_model <- rq(
+  demand_gross ~ wind + solar_S,
+  data = demand_modelling,
+  tau = c(0.1, 0.5, 0.9)  # Analyze 10th, 50th, 90th percentiles
+)
+
+# Visualize regression coefficients
+tidy(rq_model) %>%
+  filter(term != "(Intercept)") %>%
+  ggplot(aes(x = factor(tau), y = estimate, color = term)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  scale_color_manual(
+    values = c("wind" = "#1f77b4", "solar_S" = "#ff7f0e"),
+    labels = c("Wind", "Solar PV")
+  ) +
+  labs(
+    title = "Quantile Regression Coefficient Analysis",
+    x = "Demand Quantile",
+    y = "Coefficient Estimate (MW/Capacity Factor)",
+    color = "Energy Type"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal()
+
+```
+
+Overall, the exploratory analysis confirmed the central role of temperature—especially during evening peak hours—as well as seasonal and structural temporal effects. These insights informed both feature engineering and model specification, laying the foundation for the development of a transparent and interpretable regression model. 
+
+
+# Model fitting and cross-validation results
+
+## Model Selection and Refinement
+
+### 1. **Choosing Temperature Variables**
+
+To determine the most appropriate temperature variable for modeling, we compared several temperature metrics: 
+
+  - `temp`: (population-weighted average temperature at 6 p.m.)
+  - `TO`: (average temperature from 3 p.m. to 6 p.m.)
+  - `TE`: (average of TO at 6 p.m. and TE at 6 p.m. on the previous day)
+  - `average temperature`: (daily average temperature) 
+  
+The comparison involved fitting models with each temperature variable and evaluating their performance using metrics such as R², Adjusted R², MSE, and DS.
+
+The **Model with `TE` and `temp`** performed the best, as confirmed by residual analysis and cross-validation. It showed the lowest MSD and DS score, indicating the strongest fit for the temperature-demand relationship. Additionally, this model had the highest predictive power, with the strongest correlation to demand and the highest adjusted R-squared.
+
+```{r, fig.cap="Choosing Temperature Variables"}
+#Choosing temperature variable(temp,TO,TE,average temperature)
+
+# MODEL 1: Using TE only
+m_te <- lm(demand_gross ~ poly(TE, 2), data = demand_features)
+
+# MODEL 2: Using temp only
+m_temp <- lm(demand_gross ~ poly(temp, 2), data = demand_features)
+
+# MODEL3: Using TO Only
+m_to <- lm(demand_gross ~ poly(TO, 2) , data = demand_features)
+
+# MODEL4: Using temp_avg only
+m_avg <- lm(demand_gross ~ poly(temp_avg, 2), data = demand_features)
+
+# MODEL 5: TE and temp
+m_both <- lm(demand_gross ~ poly(TE, 2) + poly(temp, 2), data = demand_features)
+
+# Compute every model MSE and DS
+model_comparison_temp <- list(
+  "TE" = m_te,
+  "Temp" = m_temp,
+  "TO" = m_to,
+  "average temperature" = m_avg,
+  "TE+Temp" = m_both
+) %>%
+  purrr::map_dfr(function(model) {
+    # Extracting predicting value, residuals, sigma
+    fitted <- predict(model)
+    residuals <- residuals(model)
+    sigma <- sigma(model)
+    n <- nobs(model)
+    
+    # Compute MSE and DS
+    MSE <- mean(residuals^2)
+    DS <- sum((residuals / sigma)^2) + 2 * n * log(sigma)
+    
+    # Return result
+    glance(model) %>%
+      select(adj.r.squared) %>%
+      mutate(MSE = MSE, DS = DS)
+  }, .id = "Model")
+```
+
+```{r, results = 'asis'}
+# Display Result
+knitr::kable(model_comparison_temp, digits = 3)
+```
+
+### 2. **Polynomial Regression**
+
+From data analysis and graphical visualization, we find that the relationship between demand and temperature has nonlinear characteristics. By establishing the multiple term model:
+$$ 
+\text{M_multiple}: Y_i = \beta_0 + \beta_1 \mathit{Wind}_i + \beta_2 \mathit{Solar}_i + \beta_3 \mathit{temp}_i + \beta_4 \mathit{temp^2}_i  + \varepsilon_i, \qquad \varepsilon_i \sim \text{Normal}(0, \sigma^2) 
+$$
+It is found that the *p-value* for `temp_sq` $= 0.00694 < 0.05$, so we need to consider the higher degree term of temperature. By incorporating quadratic ($temp^2_i$) and cubic ($temp^3_i$) terms of temperature, along with polynomial terms of `TE` ($TE^2_i$, $TE^3_i$), the model achieves better fitting of this complex nonlinear relationship.
+
+Through model evaluation, we find that higher-order polynomials do not significantly improve model performance and may lead to overfitting. Therefore, the appropriate polynomial order is selected so that the model can maintain a balance between the fitting complexity and the generalization ability. However, we can try using *Ridge regression* or *Lasso regression* for regularization, in order to reduce overfitting.
+
+```{r, results = 'asis', fig.cap="Choosing Temperature Variables"}
+# Polynomial temperature terms
+demand_modelling <- demand_modelling %>% 
+  mutate(temp_sq = temp^2)
+
+
+# Fit a model with a nonlinear (quadratic) term
+model_nonlinear <- lm(demand_gross ~ temp + temp_sq + wind + solar_S, data = demand_modelling)
+# summary(model_nonlinear)
+# Since p-value for temp_sq = 0.00694 < 0.05 ---> indicates nonlinearity exists, so we include temp^2
+
+# TE and demand_gross scatter plot + non-linear fitting
+te_plot <- demand_features %>%
+  ggplot(aes(x = TE, y = demand_gross)) +
+  geom_point(alpha = 0.3, color = "#1f77b4") +
+  geom_smooth(
+    method = "lm", 
+    formula = y ~ poly(x, 2),  # Polynoimal Fitting
+    color = "#ff7f0e", 
+    se = TRUE
+  ) +
+  labs(
+    title = "TE vs Peak Demand",
+    subtitle = "Quadratic regression shows non-linear relationship",
+    x = "TE (°C)",
+    y = "Peak Demand at 6pm (MW)"
+  ) +
+  theme_minimal()
+
+# Compare temp and TE
+temp_plot <- demand_features %>%
+  ggplot(aes(x = temp, y = demand_gross)) +
+  geom_point(alpha = 0.3, color = "#1f77b4") +
+  geom_smooth(
+    method = "lm", 
+    formula = y ~ poly(x, 2),
+    color = "#2ca02c", 
+    se = TRUE
+  ) +
+  labs(
+    title = "Temperature vs Peak Demand",
+    x = "population-weighted average temperature (°C)",
+    y = "Peak Demand at 6pm (MW)"
+  )
+
+# Display align horizontally
+te_plot + temp_plot + plot_layout(ncol = 2)
+
+
+#---Regularization (Ridge and Lasso Regression)---
+# Create polynomial features manually for control
+demand_features <- demand_features %>%
+  mutate(
+    TE_sq = TE^2,
+    TE_cu = TE^3,
+    temp_sq = temp^2,
+    temp_cu = temp^3,
+    TE_qu = TE^4,
+    temp_qu = temp^4
+  )
+
+# Define predictor matrix (X) and response vector (y)
+X <- demand_features %>%
+  select(TE, TE_sq, TE_cu, TE_qu, temp, temp_sq, temp_cu, temp_cu, wind, solar_S) %>%
+  as.matrix()
+
+y <- demand_features$demand_gross
+
+# Ridge regression (alpha = 0)
+cv_ridge <- cv.glmnet(X, y, alpha = 0, standardize = TRUE)
+
+# Lasso regression (alpha = 1)
+cv_lasso <- cv.glmnet(X, y, alpha = 1, standardize = TRUE)
+
+# Best lambda values
+best_lambda_ridge <- cv_ridge$lambda.min
+best_lambda_lasso <- cv_lasso$lambda.min
+
+# Extract coefficients at best lambda
+coef_ridge <- coef(cv_ridge, s = "lambda.min")
+coef_lasso <- coef(cv_lasso, s = "lambda.min")
+
+# Predictions using best lambda models
+pred_ridge <- predict(cv_ridge, newx = X, s = "lambda.min")
+pred_lasso <- predict(cv_lasso, newx = X, s = "lambda.min")
+
+# R-squared function
+rsq <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+
+m_te    <- lm(demand_gross ~ TE^2 + TE, data = demand_features)
+m_temp  <- lm(demand_gross ~ temp^2 +temp, data = demand_features)
+m_both  <- lm(demand_gross ~ TE^2 + temp^2 + TE + temp, data = demand_features)
+m_both_3  <- lm(demand_gross ~ TE^3 + temp^3 + TE^2 + temp^2 + TE + temp, data = demand_features)
+m_both_4  <- lm(demand_gross ~ TE^4 + temp^4 + TE^3 + temp^3 + TE^2 + temp^2 + TE + temp, data = demand_features)
+
+# Helper function to get MSE
+get_lm_metrics <- function(model) {
+  fitted <- predict(model)
+  residuals <- model$residuals
+  MSE <- mean(residuals^2)
+  data.frame(
+    Model = deparse(model$call$formula),
+    Adj_R2 = summary(model)$adj.r.squared,
+    MSE = MSE
+  )
+}
+
+# Collect metrics
+lm_results <- bind_rows(
+  get_lm_metrics(m_te),
+  get_lm_metrics(m_temp),
+  get_lm_metrics(m_both),
+  get_lm_metrics(m_both_3),
+  get_lm_metrics(m_both_4)
+)
+
+# Calculate metrics
+ridge_result <- data.frame(
+  Model = "Lasso (TE^3 + temp^3 + TE^2 + tmep^2 + TE + temp)",
+  Adj_R2 = rsq(y, pred_ridge),
+  MSE = mean((y - pred_ridge)^2)
+)
+
+lasso_result <- data.frame(
+  Model = "Ridge (TE^3 + temp^3 + TE^2 + tmep^2 + TE + temp)",
+  Adj_R2 = rsq(y, pred_lasso),
+  MSE = mean((y - pred_lasso)^2)
+)
+
+# Combine all results
+all_results <- bind_rows(
+  lm_results,
+  ridge_result,
+  lasso_result
+)
+
+# Show nicely
+kable(all_results, digits = 4, caption = "Model Comparison: Regularized vs Traditional Linear Models")
+
+
+```
+
+### 3. **Adding Year as a Variable**
+
+To account for long-term trends in electricity demand, we explored different methods of incorporating the year variable:
+
+- **Year as a Constant Variable**: Initially, year was included as a linear term. However, this approach failed to capture the structural change in demand trends around 2006.
+
+- **Year Weight**: A multiplicative weight based on historical demand was tested.
+
+- **Segmented Trends**: We introduced segmented trends (`trend_pre` for years $ \leq $2006 and `trend_post` for years $>$ 2006) to account for the structural break. This approach significantly improved model fit and predictive accuracy.
+
+Method-1 improved over M0 but didn't account for the structural break. Through residual analysis and cross-validation. Method-2 shows superiority, but Method-3 has the strongest predictive power. It is recommended to modify the data-set using multiplicative weighting and add segmented trends.
+
+```{r}
+#-----------Adding year as a variable-------------------
+## odel 1: Set year as constant variable
+m_year <- lm(demand_gross ~ wind + solar_S + temp + wdayindex + monthindex + 
+               year, data = demand_features)
+
+## Model 2: add Weight for years
+# Compute base year (1991) average demand
+base_year <- 1991
+base_demand <- mean(demand_features$demand_gross[demand_features$year == base_year])
+
+# Compute each year gamma_t
+year_effect <- demand_features %>%
+  group_by(year) %>%
+  summarise(mean_demand = mean(demand_gross)) %>%
+  mutate(gamma_t = mean_demand / base_demand)
+
+# Combine and return original data
+demand_adjusted <- demand_features %>%
+  left_join(year_effect, by = "year") %>%
+  mutate(demand_scaled = demand_gross / gamma_t)
+
+m_weight <- lm(
+  demand_scaled ~ wind + solar_S + temp + wdayindex + monthindex,
+  data = demand_adjusted
+)
+
+
+## Model 3: Using multiple section trends
+m_trend <- lm(
+  demand_gross ~ wind + solar_S + temp + wdayindex + monthindex + trend_pre + trend_post,
+  data = demand_features
+)
+
+
+# Compute each model MSE and DS
+model_comparison_year <- list(
+  "Year as constant variable" = m_year,
+  "Year weight" = m_weight,
+  "Section trend" = m_trend
+) %>%
+  purrr::map_dfr(function(model) {
+    fitted <- predict(model)
+    residuals <- residuals(model)
+    sigma <- sigma(model)  
+    n <- nobs(model)    
+    
+    # Compute MSE and DS
+    MSE <- mean(residuals^2)
+    DS <- sum((residuals / sigma)^2) + 2 * n * log(sigma)
+    
+    # Return result
+    glance(model) %>%
+      select(adj.r.squared) %>%
+      mutate(MSE = MSE, DS = DS)
+  }, .id = "Model")
+```
+```{r, results = 'asis', fig.cap="Adding Year as a Variable"}
+# Display result
+knitr::kable(model_comparison_year, digits = 3)
+```
+
+#### **Baseline Model (M0)**
+
+The baseline model (M0) is a linear regression given by:
+$$ 
+\text{M0}: Y_i = \beta_0 + \beta_1 \mathit{Wind}_i + \beta_2 \mathit{Solar}_i + \beta_3 \mathit{temp}_i + \beta_4 \mathit{wdayindex}_i + \beta_5 \mathit{monthindex}_i + \varepsilon_i, \qquad \varepsilon_i \sim \text{Normal}(0, \sigma^2) 
+$$
+
+While M0 provides a starting point, it fails to capture non-linear temperature effects, time trends, and interaction effects that are critical for accurately modeling peak demand.
+
+```{r, fig.cap="Baseline Model (M0)"}
+# Construct based model M0
+model_M0 <- lm(demand_gross ~ 1 + wind + solar_S + temp + wdayindex + monthindex, data = demand_features)
+#summary(model_M0)
+```
+
+#### **Model M1**
+
+Model M1 introduces several refinements over M0:
+
+- **Temperature Effects**: Terms for temperature variables (`temp` and `TE`) are added to capture the non-linear relationship between temperature and demand.
+- **Time Trends**: Segmented trends for pre-2006 (`trendpre`) and post-2006 (`trendpost`) periods are included to account for structural changes in demand patterns.
+- **dummy variable**:
+
+$$ 
+\text{M1}: Y_i = \beta_0 + \beta_1 \mathit{Wind}_i + \beta_2 \mathit{Solar}_i + \beta_3 \mathit{temp}_i + \beta_4 \mathit{wdayindex}_i + \beta_5 \mathit{monthindex}_i + \beta_6 \mathit{TE}_i \\
+\qquad + \beta_7 \mathit{trend pre}_i + \beta_8 \mathit{trend post}_i + \beta_{pre} + \varepsilon_i, \qquad \varepsilon_i \sim \text{Normal}(0, \sigma^2) 
+$$
+
+```{r, fig.cap="Model M1"}
+# Model M1: Construct year, temperature, is_weekend
+M1_formula <- demand_gross ~ 1 +
+  wind + solar_S +            # Reusable resources
+  wdayindex +                 # week day type effect
+  monthindex +                # monthly type effect
+  temp + TE +                 # temperature effect
+  I(year > 2006)+             # based demand after 2006
+  trend_pre + trend_post +    # cross validation trend
+  is_weekend                  # weekly effect
+
+model_M1 <- lm(M1_formula, data = demand_features)   
+summary(model_M1)
+
+#----> remove 'is_week_end' because it has strong collinearity with 'wdayindex'. The model output result is NA
+M1_optimized <- update(model_M1, . ~ .  - is_weekend, data = demand_features)   
+ summary(M1_optimized)
+```
+
+#### **Model M2 (Final Model)**
+
+Model M2 further refines M1 by:
+
+- **Removing Redundant Variables**: Variables with high p-values (e.g., `temp`, `is_weekend`) are removed to improve model parsimony.
+- **Interaction Terms**: Interactions between temperature and time trends, as well as between renewable energy variables and temperature, ect. They are added to capture complex relationships.
+- **quadratic and cubic terms**: The inclusion of second- and third-order polynomial terms for both temperature ($temp^2$, $temp^3$) and thermal effectiveness ($TE^2$, $TE^3$) significantly improves the model's capacity to capture nonlinear dynamics.
+
+$$ 
+\text{M2}: Y_i = \beta_0 + \beta_1 \mathit{Wind}_i + \beta_2 \mathit{Solar}_i + \beta_3 \mathit{monthindex}_i + \beta_4 \mathit{wdayindex}_i + \beta_5 \mathit{temp^2}_i + \beta_6 \mathit{temp^3}_i  + \beta_7 \mathit{TE}_i + \beta_8 \mathit{TE^3}_i \\
+\qquad \qquad + \beta_9 \mathit{trend pre}_i + \beta_{10} \mathit{trend post}_i + \beta_{pre} + \beta_{11} \mathit{TE:trend post}_i  + \beta_{12} \mathit{TE:trend pre}_i + \beta_{13} \mathit{TE:solar_S}_i \\
++ \beta_{14} \mathit{trend pre:is weekend}_i  + \beta_{15} \mathit{trend post:is weekend}_i + \varepsilon_i, \qquad \varepsilon_i \sim \text{Normal}(0, \sigma^2) 
+$$
+
+We removed the `I(TE^2)` and `temp` terms. Because they have a strong linear association with the other terms, their corresponding p-values are too large, which leads to their extremely limited influence on the model.
+
+```{r, fig.cap="Model M1"}
+
+# Add interaction terms
+M2_formula <- demand_gross ~ 1 +
+  wind + solar_S +            # Renewable energy
+  wdayindex +                 # Main effect of day of the week
+  monthindex +                # Main effect of month
+  temp + I(temp^2) + I(temp^3) + TE + I(TE^2) + I(TE^3) +  # Temperature effect
+  I(year > 2006) +            # Change in baseline demand after 2006 (intercept)
+  trend_pre + trend_post +    # Orthogonalized segmented trends
+  TE:trend_post +             # Interaction between temperature and time trend (post)
+  TE:trend_pre +
+  TE:monthindex +             # Interaction between temperature and time period
+  TE:wind +                   # Interaction between renewable energy and temperature
+  TE:solar_S +
+  trend_pre:is_weekend +      # Interaction between time trend and periodic effect
+  trend_post:is_weekend +
+  trend_post:monthindex
+
+model_M2 <- lm(M2_formula, data = demand_features)   
+summary(model_M2)
+
+#-----> Remove independent variables with p-value > 0.05
+M2_optimized <- update(model_M2, . ~ .  - I(TE^2) -temp - TE:monthindex - TE:wind - trend_post:monthindex, data = demand_features)   
+summary(M2_optimized)
+```
+
+### Why Other Models Were Rejected
+
+**Regularized Regression (Ridge and Lasso)**:
+
+While we tried to apply Ridge regression for regularization to reduce overfitting, the polynomial linear regression ultimately demonstrated superior performance. Based on cross-validation and model evaluation metrics (e.g., adjusted $R^2$ and MSE), the polynomial linear regression showed advantages in both prediction accuracy and generalization capability.
+
+```{r, fig.cap="Model M1"}
+#---Contribute best model---
+# use Ridge (TE³ + temp³) on Final Model
+ridge_formula <- ~ 1 +
+  wind + solar_S +
+  wdayindex +
+  monthindex +         
+  I(temp^2) + I(temp^3) + TE + I(TE^3) + 
+  I(year > 2006) +     
+  trend_pre + trend_post + 
+  
+  TE:trend_post +
+  TE:trend_pre +
+  TE:solar_S +
+  trend_pre:is_weekend +
+  trend_post:is_weekend 
+
+# X matrix with all predictors (excluding intercept)
+X_ridge <- model.matrix(ridge_formula, data = demand_features)[, -1]
+
+# Response vector
+y_ridge <- demand_features$demand_gross
+
+# Cross-validated Ridge
+cv_ridge_full <- cv.glmnet(X_ridge, y_ridge, alpha = 0, standardize = TRUE)
+
+# Final Ridge model at best lambda
+ridge_final <- glmnet(X_ridge, y_ridge, alpha = 0, lambda = cv_ridge_full$lambda.min)
+
+# View best lambda
+cat("Best lambda for final Ridge model:", cv_ridge_full$lambda.min, "\n")
+
+# Predict on training data
+pred_ridge_full <- predict(ridge_final, newx = X_ridge)
+
+# R² and MSE
+rsq <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+ridge_rsq <- rsq(y_ridge, pred_ridge_full)
+ridge_mse <- mean((y_ridge - pred_ridge_full)^2)
+
+cat("Final Ridge Model R²:", round(ridge_rsq, 4), "\n")
+cat("Final Ridge Model MSE:", round(ridge_mse, 2), "\n")
+
+
+final_formula <- demand_gross ~ 1 +
+  wind + solar_S +
+  wdayindex +
+  monthindex + 
+  poly(temp,2) + poly(temp,3) + TE + poly(TE,3) +
+  I(year > 2006)+     
+  trend_pre + trend_post + 
+  
+  TE:trend_post +
+  TE:trend_pre +
+  TE:solar_S +
+  trend_pre:is_weekend +
+  trend_post:is_weekend 
+
+final_model <- lm(final_formula, data = demand_features)
+summary(final_model)
+
+final_lm_mse <- mean((demand_features$demand_gross - predict(final_model))^2)
+final_lm_r2 <- summary(final_model)$adj.r.squared
+
+comparison <- tibble::tibble(
+  Model = c("Original lm() final_model", "Ridge (TE³ + temp³ + interactions)"),
+  Adj_R2 = c(final_lm_r2, ridge_rsq),
+  MSE = c(final_lm_mse, ridge_mse)
+)
+```
+```{r, results = 'asis', fig.cap="Model M1"}
+knitr::kable(comparison, digits = 4, caption = "Final Model Comparison: lm() vs Ridge")
+#---> choose final linear regression model
+```
+
+### Scenario Analysis: Maximum Demand Variation under Historical Weather Conditions
+
+We conducted a scenario analysis to see how the 2013–14 winter peak demand might change under different historical weather conditions. We created several weather scenarios, substituting the 2013–14 weather with data from past winters (`1991`, `1992`, `1993`, and `2005`), while keeping the same time structure. This helped us focus on weather's impact on maximum annual 
+
+The results showed significant variation in maximum demand across scenarios. The original 2013-14 winter had a maximum demand of **52,453 MW**. Colder winters, like `1993`, were linked to higher peak demands. However, lower average temperatures didn't always mean higher demand. For example, `2005` had a lower average temperature, but its relatively mild minimum temperatures resulted in lower maximum demand than `1991` and `1993`.
+
+This analysis shows the importance of weather in peak electricity demand. It offers NESO a clearer view of potential demand variations under different weather scenarios, aiding long-term planning and supply security.
+```{r}
+# ---------------------------  
+# Analyze the changes in the maximum annual demand during the winter of 2013-14 under different historical weather conditions  
+# ---------------------------  
+## 1. Data Preparation and Weather Scenario Construction  
+# Define the baseline winter (2013-14)
+base_winter <- demand_features %>%
+  filter(
+    Date >= as.Date("2013-11-01"),
+    Date <= as.Date("2014-03-31")
+  ) %>%
+  select(-temp, -TE, -wind, -solar_S)  # Remove weather variable
+
+# Determine the date range for the winter of 2013-14 (assuming winter is from November to March of the following year).
+base_dates <- seq(as.Date("2013-11-01"), as.Date("2014-03-31"), by = "day")
+
+# Extract the baseline data (excluding weather variables).
+base_data <- demand_modelling %>%
+  filter(Date %in% base_dates) %>%
+  select(-temp, -wind, -solar_S)  # Remove weather variables, which will be replaced with historical weather data later.
+
+# Extract historical weather data.
+historical_winters <- list(
+  winter_1991 = seq(as.Date("1991-11-01"), as.Date("1992-03-31"), by = "day"),
+  winter_1992 = seq(as.Date("1992-11-01"), as.Date("1993-03-31"), by = "day"),
+  winter_1993 = seq(as.Date("1993-11-01"), as.Date("1994-03-31"), by = "day"),
+  winter_2005 = seq(as.Date("2005-11-01"), as.Date("2006-03-31"), by = "day")
+)
+
+# Extract weather variables for each winter (retain alignment with DSN).
+weather_data <- lapply(historical_winters, function(dates) {
+  demand_features %>%
+    filter(Date %in% dates) %>%
+    mutate(DSN = DSN) %>%  # Use the original DSN for alignment
+    select(DSN, temp, TE, wind, solar_S)
+})
+
+# Construct a weather scenario dataset.
+scenarios <- lapply(weather_data, function(weather) {
+  base_winter %>%
+    left_join(weather, by = "DSN") %>%  # Align strictly by DSN.
+    filter(!is.na(temp))  # Remove dates without weather data.
+})
+
+## 2. Demand Forecasting and Extreme Value Analysis
+# Predict demand for each scenario. 
+predict_scenario <- function(scenario_data) {
+  scenario_data %>%
+    mutate(
+      pred_demand = predict(final_model, newdata = .),
+      # Calculate temperature-related metrics.
+      temp_bin = cut(temp, breaks = c(-Inf, 0, 5, 10, Inf)),
+      TE_squared = TE^2
+    )
+}
+
+scenario_results <- lapply(scenarios, predict_scenario)
+
+# Extract the maximum annual demand.
+max_demands <- sapply(scenario_results, function(df) {
+  max(df$pred_demand, na.rm = TRUE)
+})
+
+# Construct a results table. 
+results_table <- data.frame(
+  Scenario = names(historical_winters),
+  MaxDemand_MW = max_demands,
+  AvgTemp = sapply(scenario_results, function(df) mean(df$temp, na.rm = TRUE)),
+  AvgTE = sapply(scenario_results, function(df) mean(df$TE, na.rm = TRUE)),
+  MinTemp = sapply(scenario_results, function(df) min(df$temp, na.rm = TRUE)),
+  MinTE = sapply(scenario_results, function(df) min(df$TE, na.rm = TRUE)),
+  Wind_Avg = sapply(scenario_results, function(df) mean(df$wind, na.rm = TRUE)),
+  Solar_Avg = sapply(scenario_results, function(df) mean(df$solar_S, na.rm = TRUE)),
+  Wind_Max = sapply(scenario_results, function(df) max(df$wind, na.rm = TRUE)),
+  Solar_Max = sapply(scenario_results, function(df) max(df$solar_S, na.rm = TRUE))
+) 
+
+# Assume the actual data for the original 2013-14 winter.
+original_2013 <- data.frame(
+  Scenario = "Original 2013-14 Winter",
+  MaxDemand_MW = max(demand_features$demand_gross[demand_features$Date %in% base_dates]),
+  AvgTemp = mean(demand_features$temp[demand_features$Date %in% base_dates]),
+  AvgTE = mean(demand_features$TE[demand_features$Date %in% base_dates], na.rm = TRUE),
+  MinTemp = min(demand_features$temp[demand_features$Date %in% base_dates]),
+  MinTE = min(demand_features$TE[demand_features$Date %in% base_dates], na.rm = TRUE),
+  Wind_Avg = mean(demand_features$wind[demand_features$Date %in% base_dates]),
+  Solar_Avg = mean(demand_features$solar_S[demand_features$Date %in% base_dates]),
+  Wind_Max = max(demand_features$wind[demand_features$Date %in% base_dates]),
+  Solar_Max = max(demand_features$solar_S[demand_features$Date %in% base_dates])
+)
+
+# Merge the original data into the results table.
+final_table <- rbind(original_2013, results_table) %>%
+  arrange(MaxDemand_MW)  # Sort by demand in descending order.
+```
+
+```{r, results = 'asis', fig.cap="Model M1"}
+## 3. Output visualization.
+# Use `kable` to output an aesthetically pleasing table.
+final_table %>%
+  kable(
+    format = "html",
+    align = "c",
+    digits = 2,
+    col.names = c("Scenario", "Max Demand (MW)", "Avg Temp (°C)", "Avg TE (°C)", 
+                  "Min Temp (°C)", "Min TE (°C)", "Wind Avg", "Solar Avg", 
+                  "Wind Max", "Solar Max"),
+    caption = "Analysis of the Changes in the Maximum Demand during the 2013-14 Winter under Different Historical Weather Conditions",
+    row.names = FALSE  # Key Fix: Disable the display of the row number column.
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    font_size = 12
+  ) %>%
+  add_header_above(
+    c(" " = 1,                # The first column (Scenario) is not grouped.
+      "Temperature Metrics" = 5,  # Temperature-related columns (Avg Temp, Avg TE, Min Temp, Min TE).
+      "Renewables Metrics" = 4   # Renewable energy columns (Wind Avg, Solar Avg, Wind Max, Solar Max).）
+    )
+  ) %>%
+  row_spec(which(final_table$Scenario == "Original 2013-14 Winter"), 
+           bold = TRUE, color = "white", background = "#2c3e50")
+
+# Extract the number of all scenarios.
+all_scenarios <- bind_rows(scenario_results, .id = "Scenario")
+
+```
+
+
+## Compare Model
+
+### Model Performance Comparison
+
+```{r}
+
+calculate_model_metrics <- function(model, data, demand_var = "demand_gross") {
+  # Compute basic residuals
+  residuals <- residuals(model)
+  
+  # Compute standard performance metrics
+  metrics <- list(
+
+    R2 = summary(model)$r.squared %>% round(3),
+
+    Adj_R2 = summary(model)$adj.r.squared %>% round(3),
+
+    RMSE = sqrt(mean(residuals^2)) %>% round(1),
+
+    MAE = mean(abs(residuals)) %>% round(1)
+
+  )
+
+  # Compute metrics for extreme days (95th percentile)
+
+  extreme_threshold <- quantile(data[[demand_var]], 0.95, na.rm = TRUE)
+
+  extreme_days <- data[[demand_var]] >= extreme_threshold
+
+  metrics$Extreme_MAE <- mean(abs(residuals[extreme_days])) %>% round(1)
+
+  return(metrics)
+
+}
+
+# Calculate metrics for each model
+
+metrics_M0 <- calculate_model_metrics(model_M0, demand_features)
+
+metrics_M1 <- calculate_model_metrics(M1_optimized, demand_features)
+
+metrics_M2 <- calculate_model_metrics(M2_optimized, demand_features)
+
+# 1. Build comparison table
+performance_table <- bind_rows(
+
+  metrics_M0 %>% as_tibble() %>% add_column(Model = "M0 (Baseline)", .before = 1),
+
+  metrics_M1 %>% as_tibble() %>% add_column(Model = "M1 (Optimized)", .before = 1),
+
+  metrics_M2 %>% as_tibble() %>% add_column(Model = "M2 (Final)", .before = 1)  
+
+) %>% 
+
+  select(Model, R2, Adj_R2, RMSE, MAE, Extreme_MAE)
+
+```
+
+To compare the predictive performance and suitability of the proposed models, we computed standard regression metrics for **M0 (Baseline)**, **M1 (Optimized)** and **M2 (Final)**.
+
+The following table summarizes the key performance metrics across the three models:
+
+```{r,results = 'asis'}
+
+# Generate styled performance table
+
+kable(performance_table, 
+
+      align = c("l", rep("c", 5)),
+
+      col.names = c("Model", "R²", "Adjusted R²", "RMSE (MW)", "MAE (MW)", "Extreme Day MAE (MW)"),
+
+      caption = "Model Performance Comparison Table") %>%
+
+  kable_styling(
+
+    bootstrap_options = c("striped", "hover", "condensed"),
+
+    full_width = FALSE,
+
+    position = "center"
+
+  ) %>%
+
+  add_header_above(c(" " = 1, "Goodness of Fit" = 2, "Prediction Error" = 3)) %>%
+
+  footnote(
+
+    general = "Note: All error metrics are in megawatts (MW); extreme days are defined as the top 5% of demand values.",
+
+    general_title = ""
+
+  )
+```
+
+The results indicate a progressive improvement from M0 to M1 and further to M2. The final model (M2) achieves the highest adjusted R² of **0.794**, coupled with lowest each of the terms of its prediction error. Notably, the extreme day MAE for M2 is more than 60% lower than that of M0 (reduced from 5023.7 MW to 1917.7 MW), underscoring its superior ability to forecast high-demand days, which is critical for NESO’s planning and operational requirements.
+
+### Residual Analysis on Extreme Demand Days
+
+To further assess the quality of predictions for the upper tail of the demand distribution, we analyzed the residuals (errors) from M1 on extreme demand days (i.e., days where demand exceeds the 95th percentile).
+
+#### Residual Distribution on Extreme Days
+
+```{r}
+
+# Extreme Day Residual Distribution Plot  
+
+# Calculate residuals
+
+residuals <- residuals(model_M2)
+
+
+# RMSE
+
+RMSE <- sqrt(mean(residuals^2))
+
+# MAE
+
+MAE <- mean(abs(residuals))
+
+# Extreme Day Forecasting Error (MAE of 95th Percentile Day)
+
+high_demand_threshold <- quantile(demand_adjusted$demand_gross, 0.95)
+
+extreme_days <- demand_adjusted$demand_gross >= high_demand_threshold
+
+MAE_extreme <- mean(abs(residuals[extreme_days]))
+
+# Plot a histogram and save the results
+
+hist_result <- hist(residuals[extreme_days], 
+
+                    breaks = 30, 
+
+                    main = "Residual distribution on extreme days", 
+
+                    xlab = "Residual values")
+
+# Extract bin boundaries and calculate bin width
+
+hist_breaks <- hist_result$breaks
+
+bin_width <- diff(hist_breaks)[1]
+
+# Add a normal distribution curve (adjust the amplitude to match the frequency).
+
+curve(dnorm(x, 
+
+            mean = mean(residuals[extreme_days]), 
+
+            sd = sd(residuals[extreme_days])) * 
+
+        length(residuals[extreme_days]) * bin_width,
+
+      col = "red", 
+
+      lwd = 2, 
+
+      add = TRUE)
+```
+
+The histogram above illustrates the residual distribution on extreme demand days, overlaid with a normal density curve. The distribution is approximately symmetric but exhibits slight right-skewness, indicating a concentration of residuals around zero with a few larger positive errors. This pattern suggests that the model tends to slightly underpredict the highest demand values, which is conservative from a system security perspective. 
+
+The Mean Absolute Error (MAE) for extreme days aligns with the overall performance metrics (1917.7 MW for M2), reinforcing the model's reliability in forecasting during periods of high system stress. 
+
+### Residual Diagnostics
+
+Residual diagnostics for the optimized model (M2) were performed to verify linear regression assumptions. The standard diagnostic plots include:
+
+- **Residuals vs Fitted**:shows a slight funnel pattern, indicating mild heteroscedasticity.
+
+- **Q-Q Plot**: reveals deviations from normality in the lower tail and some heavy-tailed behavior, suggesting non-normality in residuals.
+
+- **Scale-Location**: indicates acceptable variance stability overall.
+
+- **Residuals vs Leverage**: highlights a few moderately influential points but no extreme outliers.
+
+These findings suggest that while some assumptions are mildly violated, the model remains robust for forecasting purposes.
+```{r, results = 'asis', fig.cap="Standard Diagnostic Plots for Model M2"}
+
+par(mfrow = c(2, 2))
+
+plot(model_M2)
+
+```
+
+
+#### Residual Distribution in the Upper Tail
+
+To address NESO's focus on extreme demand prediction, we assessed the residual behavior for the top 5% of demand days. A focused Q-Q plot was generated after refitting model M2 to this high-demand subset.
+
+```{r}
+# Upper-tail residuals
+
+## Select data where `demand_gross` is greater than the 95th percentile.
+
+demand_high <- demand_features %>%
+
+  filter(demand_gross > quantile(demand_gross, 0.95)) %>%
+
+  droplevels()
+
+demand_high <- demand_high %>%
+
+  mutate(is_weekend = as.numeric(is_weekend))
+
+# Refit the M1 formula on the filtered data.
+
+model_M2_95 <- lm(M1_formula, data = demand_high)
+
+# Extract residuals.
+
+residuals_M2_95 <- residuals(model_M2_95)
+```
+
+```{r, results = 'asis'}
+
+ggplot(data.frame(sample = residuals_M2_95), aes(sample = sample)) +
+
+  stat_qq(distribution = qnorm) +
+
+  stat_qq_line(distribution = qnorm) +
+
+  labs(title = "Upper-Tail Q-Q Plot (95% Data)", 
+
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+
+  theme_minimal()
+```
+The Q-Q plot for extreme demand days shows residuals closely aligning with normality, with only slight curvature at the extremes. This confirms the model’s error structure is well-behaved for high-demand winter days, supporting reliable extreme-event forecasting.
+
+
+### Variable Importance Analysis
+
+To assess the contribution of individual predictors in the optimized model (M1), we computed**standardized coefficients** by multiplying each estimated coefficient with the standard deviation of its corresponding predictor. This allows for direct comparison of variable importance regardless of original scale. The results, sorted by absolute magnitude, are as follows:
+```{r, results = 'asis'}
+# 3. Variable importance (standardized coefficients).
+model_matrix <- model.matrix(final_model)
+coef_names <- names(coef(final_model))
+
+# 确保列名一致
+common_names <- intersect(coef_names, colnames(model_matrix))
+model_matrix <- model_matrix[, common_names]
+
+std_coef <- data.frame(
+  variable = common_names,
+  effect = coef(final_model)[common_names] * apply(model_matrix, 2, sd)
+) %>% arrange(desc(abs(effect)))
+
+# Create formatted table
+std_coef %>%
+  rename(`Standardized Effect` = effect) %>%
+  kable(
+    caption = "Standardized Coefficients (Variable Importance)",
+    align = c("l", "r"),
+    digits = 3,
+    row.names = FALSE
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  column_spec(2, background = "#f7f7f7") %>%
+  footnote(
+    general = "Effects calculated as coefficients multiplied by predictor SD",
+    general_title = "Note:"
+  )
+```
+
+#### Key findings from the table:
+
+- The most influential predictor is `trend_pre`, indicating that pre-2006 trends significantly contribute to explaining demand levels.
+
+- Weekday indicators such as wdayindexTue, Wed, and Mon also rank highly, showing strong weekly seasonality in peak demand.
+
+- Temperature-related terms (I(TE²) and TE) exhibit large negative effects, confirming a non-linear inverse relationship between temperature and demand (colder days increase demand).
+
+- Renewable generation factors (solar_S, wind) have smaller effects but are interpretable.
+
+
+```{r tidy-final-model, results = 'asis'}
+tidy(final_model) %>%
+
+  filter(term != "(Intercept)") %>%
+
+  mutate(p.value = sprintf("%.3g", p.value)) %>%
+
+  arrange(desc(abs(estimate))) %>%
+
+  select(term, estimate, p.value) %>%
+
+  head(10) %>%
+
+  kable(
+
+    caption = "Top 10 Most Influential Variables in Final Model",
+
+    col.names = c("Variable", "Estimate", "p-value"),
+
+    digits = 3,
+
+    align = "lcc"
+
+  ) %>%
+
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+**The final model explains approximately 79.6% of the variance in peak demand** (Adjusted R² = 0.7945), and achieves a residual standard error of 2320 MW. Most variables, including day-of-week indicators, temperature terms (TE, TE²), and year trends are statistically significant at the 0.001 level.
+
+The coefficient on I(TE^2) is negative and significant (p < 0.001), confirming a non-linear relationship between temperature and demand.
+
+Day-of-week variables (wdayindexTue, Wed, etc.) have large positive effects, aligning with working-day peak consumption behavior.
+
+Renewable energy (solar_S) shows a negative coefficient, reflecting reduced demand net of generation.
+
+Interaction terms such as TE:trend_post and solar_S:TE are also significant, indicating that the impact of temperature evolves over time and interacts with renewable input.
+
+
+## Cross-Validation and Monthly Performance Comparison
+
+```{r}
+# Perform cross-validation
+
+cv_results <- map_dfr(c("M0", "M1", "Final"), ~{
+
+  results <- tryCatch(
+
+    kfold_validate(train_data, model_type = .x, k = 10),
+
+    error = function(e) NULL
+
+  )
+
+  if (!is.null(results)) mutate(results, model = .x)
+
+})
+# Evaluation calculation
+model_scores <- compute_scores(cv_results)
+
+# Summarize evaluations
+final_scores <- model_scores %>% 
+
+  group_by(model) %>% 
+
+  summarise(
+
+    MSE_mean = mean(MSE),
+
+    MSE_se = sd(MSE) / sqrt(n()),
+
+    DS_mean = mean(DS),
+
+    DS_se = sd(DS) / sqrt(n()),
+
+    .groups = "drop"
+
+  )
+
+
+# PLOT GRAPH
+
+p_m0 <- plot_pred_vs_actual(cv_results, "M0", "#1f77b4")
+
+p_m1 <- plot_pred_vs_actual(cv_results, "M1", "#ff7f0e")
+
+p_final <- plot_pred_vs_actual(cv_results, "Final", "#2ca02c")
+
+monthly_mse <- cv_results %>%
+  mutate(
+    demand_gross = as.numeric(demand_gross),
+    pred_mean = as.numeric(predicted.mean),
+    month = lubridate::month(Date)
+  ) %>%
+  group_by(model, month) %>%
+  summarise(
+    mse = mean((demand_gross - pred_mean)^2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+monthly_mse_table <- monthly_mse %>% 
+  pivot_wider(names_from = model, values_from = mse) %>% 
+  mutate(
+    Month = month.name[month],
+    Month = factor(Month, levels = month.name)
+  ) %>% 
+  select(Month, M0, M1, Final) %>% 
+  arrange(Month)
+
+monthly_mse_table %>%
+  kbl(
+    format = "html",
+    digits = 1,
+    caption = "Monthly MSE Comparison Across Models",
+    col.names = c("Month", "M0", "M1", "Final")
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE
+  )
+```
+
+To assess the generalizability and robustness of the fitted models, we performed **k-fold cross-validation (k = 10)** using month-based stratification, ensuring each fold reflects different seasonal patterns. This procedure was repeated across all three models: M0 (baseline), M1 (optimized), and Final (interaction-enhanced). The evaluation metrics included MSE (Mean Squared Error) and DS (Dawid–Sebastiani Score).
+
+```{r crossval-summary-table, echo=FALSE}
+# Output as a table
+final_table <- final_scores %>% 
+  transmute(
+    Model = model,
+    MSE = sprintf("%.1f ± %.1f", MSE_mean, MSE_se),
+    DS = sprintf("%.1f ± %.1f", DS_mean, DS_se)
+  )
+
+final_table %>%
+  kbl(
+    format = "html", # Choose "html" or "latex" based on the output type
+    caption = "Cross-validation Performance Comparison (Mean ± Standard Error)",
+    col.names = c("Model", "MSE (Mean ± SE)", "Dawid-Sebastiani Score"),
+    align = c("l", "c", "c")  # Column alignment
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    font_size = 13,
+    position = "center"
+  ) %>%
+  add_header_above(c(" " = 1, "Performance Metrics" = 2)) %>%  # Add grouped table headers
+  column_spec(1, bold = TRUE, width = "6em") %>%  # Bold the model column
+  column_spec(2:3, width = "10em") %>%  # Width of the metric columns
+  row_spec(which.min(final_scores$MSE_mean),  # Highlight the model with the lowest MSE
+           bold = TRUE, 
+           color = "white",
+           background = "#2c3e50"
+  ) %>%
+  footnote(
+    general = "Explanation of evaluation metrics:",
+    number = c(
+      "MSE = Mean Squared Error (the smaller the better)",
+      "DS = Dawid-Sebastiani score (the smaller the better)"
+    ),
+    footnote_as_chunk = TRUE
+  )
+
+```
+
+As seen above, the Final model achieves the lowest MSE (5.45M ± 0.53M) and DS score (16.5 ± 0.1), outperforming both M0 and M1. The gap is especially significant compared to M0, which exhibits far larger error margins and lower reliability.
+
+### Predicted vs Actual Demand (Visual Check)
+
+To further inspect model behavior, we plotted predicted vs actual values from all models:
+
+```{r, results = 'asis'}
+
+p_m0 + p_m1 + p_final + patchwork::plot_layout(ncol = 3)
+
+```
+
+The baseline model (left) shows substantial dispersion and systematic bias, while M1 (center) shows marked improvement. The Final model (right) demonstrates tight clustering along the diagonal, confirming its superior calibration and accuracy.
+
+### Monthly MSE Breakdown
+
+To explore temporal consistency, we calculated monthly MSE values across models:
+```{r, results = 'asis'}
+
+monthly_mse_table %>%
+
+  kbl(
+
+    format = "html",  # Choose "html" or "latex" based on the output type
+
+    digits = 1,
+
+    caption = "Monthly MSE Comparison Across Models",
+
+    col.names = c("Month", "M0", "M1", "Final")
+
+  ) %>%
+
+  kable_styling(
+
+    bootstrap_options = c("striped", "hover"),
+
+    full_width = FALSE
+
+  )
+```
+
+The final model outperforms M0 and M1 across all months. Model performance varies monthly, with high accuracy (low MSE) in February and November, but a near 100-fold MSE increase in December. Improvements are most notable in January, where demand is highest and most volatile, yet less pronounced in December.
+
+The high accuracy in February and November suggests that these months' demand patterns are well-captured by the model, possibly due to stable demand trends or effective feature representation. And the significant MSE increase in December may stem from unique seasonal factors, such as holidays or extreme weather, causing demand volatility that the model struggles to predict.
+
+# Conslusion
+
+The final model (M2) demonstrates strong performance in fitting historical daily peak electricity demand data. With an R² of 0.797 and Adjusted R² of 0.795, the model explains a significant portion of demand variability while remaining robust to overfitting. The RMSE of 2307.3 MW and MAE of 1420.2 MW indicate reasonable prediction accuracy, particularly given the scale of demand. Notably, the Extreme Day MAE of 1917.7 MW highlights the model's effectiveness in predicting high-demand events, which are critical for planning. While the absolute error values are non-negligible, the model provides a reliable foundation for NESO's long-term planning, though further refinements could enhance its predictive power.
+
+A dependable and understandable framework for forecasting the daily peak demand for electricity in Great Britain is provided by the final regression model (M2). Undoubtedly, this model is subject to several limitations.The heteroscedasticity, especially in the top tail of the demand distribution, is suggested by residual diagnostics, which may compromise the accuracy of forecasts in severe circumstances. Furthermore, socioeconomic or policy-related factors that can become more significant over time, such economic activity or the adoption of electric vehicles, are not included in the model.  More adaptable models (such as additive or non-parametric techniques) could better handle complicated interactions without sacrificing interpretability, even though polynomial terms aid in capturing non-linearities.
+
+M2 can be a useful tool for NESO's long-term planning and supply security assessments because of its simplicity and performance. As the energy landscape changes, we advise updating the model frequently to take into account new information and reevaluate presumptions. In the future, NESO might think about expanding this approach to solve variance difficulties with **generalized least squares (GLS)** or investigate **machine learning** techniques to capture higher-order interactions. The model can continue to offer helpful recommendations for planning risk reduction and infrastructure investment with diligent observation and improvement.
+
+# Code Appendix
+
+Include here all the code used in your analysis. Ensure that the code is well-commented so it is easy to follow and reuse.
+
+```{r code=readLines("code.R"), eval=FALSE, echo=TRUE}
+# Do not change this code chunk
+```
